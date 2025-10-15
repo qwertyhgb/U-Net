@@ -3,7 +3,7 @@
 __pycache__/
 checkpoints/
 *.pth
-*.jpg
+# *.jpg
 venv/
 .idea/
 wandb/
