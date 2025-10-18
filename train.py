@@ -485,7 +485,12 @@ def train_model(
     # 5.3 混合精度训练缩放器
     # 用于混合精度训练的梯度缩放，确保训练稳定性
     # 当使用FP16精度时，梯度可能过小，需要放大后更新参数
-    grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    try:
+        # 使用新的API (PyTorch 2.0+)
+        grad_scaler = torch.amp.GradScaler('cuda', enabled=amp)
+    except AttributeError:
+        # 向后兼容旧版本PyTorch
+        grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     
     # 5.4 损失函数配置
     # 根据任务类型选择合适的损失函数
@@ -645,12 +650,26 @@ def train_model(
                             tag = tag.replace('/', '.')  # 将路径分隔符替换为点号，便于WandB显示
                             
                             # 记录权重分布直方图（排除无穷大和NaN值）
-                            if value.grad is not None and not (torch.isinf(value) | torch.isnan(value)).any():
-                                histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
+                            try:
+                                if value.grad is not None and not (torch.isinf(value) | torch.isnan(value)).any():
+                                    # 确保张量是连续的且非稀疏的
+                                    weight_data = value.data.cpu().contiguous()
+                                    if not weight_data.is_sparse:
+                                        histograms['Weights/' + tag] = wandb.Histogram(weight_data)
+                            except Exception:
+                                # 如果记录权重失败，跳过但不影响训练
+                                pass
                             
                             # 记录梯度分布直方图（排除无穷大和NaN值）
-                            if value.grad is not None and not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                                histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
+                            try:
+                                if value.grad is not None and not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
+                                    # 确保梯度张量是连续的且非稀疏的
+                                    grad_data = value.grad.data.cpu().contiguous()
+                                    if not grad_data.is_sparse:
+                                        histograms['Gradients/' + tag] = wandb.Histogram(grad_data)
+                            except Exception:
+                                # 如果记录梯度失败，跳过但不影响训练
+                                pass
 
                         # 在验证集上评估模型性能
                         # 这会切换到评估模式，计算Dice系数等指标
@@ -665,13 +684,34 @@ def train_model(
                         
                         # 记录详细的验证信息到WandB
                         try:
+                            # 处理预测掩码的维度问题，确保与WandB兼容
+                            if model.n_classes == 1:
+                                # 二分类任务：使用sigmoid + 阈值处理
+                                pred_mask = (F.sigmoid(masks_pred[0, 0]) > 0.5).float().cpu()
+                            else:
+                                # 多分类任务：使用argmax处理
+                                pred_mask = masks_pred.argmax(dim=1)[0].float().cpu()
+                            
+                            # 确保掩码张量是正确的2D格式用于WandB
+                            if pred_mask.dim() > 2:
+                                pred_mask = pred_mask.squeeze()
+                            if pred_mask.dim() < 2:
+                                pred_mask = pred_mask.unsqueeze(0)
+                                
+                            # 确保真实掩码也是2D格式
+                            true_mask = true_masks[0].float().cpu()
+                            if true_mask.dim() > 2:
+                                true_mask = true_mask.squeeze()
+                            if true_mask.dim() < 2:
+                                true_mask = true_mask.unsqueeze(0)
+                            
                             experiment.log({
                                 'learning rate': optimizer.param_groups[0]['lr'],  # 当前学习率
                                 'validation Dice': val_score,                       # 验证集Dice分数
                                 'images': wandb.Image(images[0].cpu()),            # 输入图像
                                 'masks': {                                         # 掩码对比
-                                    'true': wandb.Image(true_masks[0].float().cpu()),     # 真实掩码
-                                    'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu()),  # 预测掩码
+                                    'true': wandb.Image(true_mask),                # 真实掩码
+                                    'pred': wandb.Image(pred_mask),                # 预测掩码
                                 },
                                 'step': global_step,                               # 全局步数
                                 'epoch': epoch,                                    # 当前轮次
