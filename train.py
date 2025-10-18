@@ -71,6 +71,7 @@ from torch.utils.data import DataLoader, random_split  # 数据加载和划分�
 # ================================
 from pathlib import Path  # 路径处理工具，提供跨平台路径操作
 from tqdm import tqdm     # 进度条显示库，提供美观的训练进度可视化
+from typing import Tuple, Dict, Any
 
 # ================================
 # 项目相关导入
@@ -80,6 +81,131 @@ from evaluate import evaluate  # 模型验证评估函数，计算Dice系数等�
 from unet import UNet         # UNet模型架构定义，编码器-解码器分割网络
 from utils.data_loading import BasicDataset, CarvanaDataset  # 数据集加载类，支持多种数据格式
 from utils.dice_score import dice_loss  # Dice损失函数，专门用于分割任务的损失计算
+
+
+# ================================
+# 工具函数
+# ================================
+def _log_histograms(model: torch.nn.Module) -> Dict[str, Any]:
+    """
+    收集模型权重和梯度的分布信息
+    
+    Args:
+        model: 待分析的模型
+        
+    Returns:
+        dict: 包含权重和梯度分布的字典
+    """
+    histograms = {}
+    for tag, value in model.named_parameters():
+        tag = tag.replace('/', '.')  # 将路径分隔符替换为点号，便于WandB显示
+        
+        # 记录权重分布直方图（排除无穷大和NaN值）
+        try:
+            if value.grad is not None and not (torch.isinf(value) | torch.isnan(value)).any():
+                # 确保张量是连续的且非稀疏的
+                weight_data = value.data.cpu().contiguous()
+                if not weight_data.is_sparse:
+                    histograms['权重/' + tag] = wandb.Histogram(weight_data)
+        except Exception:
+            # 如果记录权重失败，跳过但不影响训练
+            pass
+        
+        # 记录梯度分布直方图（排除无穷大和NaN值）
+        try:
+            if value.grad is not None and not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
+                # 确保梯度张量是连续的且非稀疏的
+                grad_data = value.grad.data.cpu().contiguous()
+                if not grad_data.is_sparse:
+                    histograms['梯度/' + tag] = wandb.Histogram(grad_data)
+        except Exception:
+            # 如果记录梯度失败，跳过但不影响训练
+            pass
+    
+    return histograms
+
+
+class EarlyStopping:
+    """早停机制类，用于防止过拟合"""
+    
+    def __init__(self, patience: int = 10, min_delta: float = 0.001, restore_best_weights: bool = True):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.restore_best_weights = restore_best_weights
+        self.best_score = None
+        self.counter = 0
+        self.best_weights = None
+        
+    def __call__(self, val_score: float, model: torch.nn.Module) -> bool:
+        """
+        检查是否应该早停
+        
+        Args:
+            val_score: 当前验证分数
+            model: 模型实例
+            
+        Returns:
+            bool: True表示应该停止训练
+        """
+        if self.best_score is None:
+            self.best_score = val_score
+            self._save_weights(model)
+        elif val_score >= self.best_score + self.min_delta:
+            # 验证分数有显著提升，更新最佳分数
+            self.best_score = val_score
+            self.counter = 0
+            self._save_weights(model)
+        else:
+            # 验证分数没有显著提升，增加计数器
+            self.counter += 1
+            if self.counter >= self.patience:
+                if self.restore_best_weights and self.best_weights is not None:
+                    model.load_state_dict(self.best_weights)
+                    logging.info(f'恢复最佳权重，最佳验证分数: {self.best_score:.4f}')
+                return True
+            
+        return False
+    
+    def _save_weights(self, model: torch.nn.Module):
+        """保存当前最佳权重"""
+        self.best_weights = model.state_dict().copy()
+
+
+def _prepare_mask_for_logging(masks_pred: torch.Tensor, true_masks: torch.Tensor, 
+                            model: torch.nn.Module) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    准备用于WandB日志记录的掩码张量
+    
+    Args:
+        masks_pred: 预测掩码张量
+        true_masks: 真实掩码张量
+        model: 模型实例
+        
+    Returns:
+        tuple: (处理后的预测掩码, 处理后的真实掩码)
+    """
+    # 处理预测掩码的维度问题，确保与WandB兼容
+    if model.n_classes == 1:
+        # 二分类任务：使用sigmoid + 阈值处理
+        pred_mask = (F.sigmoid(masks_pred[0, 0]) > 0.5).float().cpu()
+    else:
+        # 多分类任务：使用argmax处理
+        pred_mask = masks_pred.argmax(dim=1)[0].float().cpu()
+    
+    # 确保掩码张量是正确的2D格式用于WandB
+    if pred_mask.dim() > 2:
+        pred_mask = pred_mask.squeeze()
+    if pred_mask.dim() < 2:
+        pred_mask = pred_mask.unsqueeze(0)
+        
+    # 确保真实掩码也是2D格式
+    true_mask = true_masks[0].float().cpu()
+    if true_mask.dim() > 2:
+        true_mask = true_mask.squeeze()
+    if true_mask.dim() < 2:
+        true_mask = true_mask.unsqueeze(0)
+    
+    return pred_mask, true_mask
 
 
 # ================================
@@ -116,6 +242,8 @@ class Config:
     # ================================
     RANDOM_SEED = 42        # 随机数种子，确保实验可重复性
     VAL_INTERVAL = 0.2     # 验证间隔比例（每训练多少轮进行一次验证）
+    PATIENCE = 10          # 早停耐心值（连续多少轮验证指标不提升则停止）
+    MIN_DELTA = 0.001      # 早停最小改进阈值
     
     # ================================
     # 硬件资源相关配置
@@ -378,13 +506,16 @@ def train_model(
     # ================================
     # 3. 数据加载器配置和创建
     # ================================
-    # 配置高效的数据加载器参数，平衡内存使用和加载速度
+    # 动态配置数据加载器参数，根据设备和批次大小优化
+    num_workers = min(Config.NUM_WORKERS, batch_size * 2) if batch_size > 1 else Config.NUM_WORKERS
+    
     loader_args = dict(
         batch_size=batch_size,                    # 批次大小，根据显存调整
-        num_workers=Config.NUM_WORKERS,          # 数据加载线程数，避免CPU过载
+        num_workers=num_workers,                 # 动态调整数据加载线程数
         pin_memory=Config.PIN_MEMORY,            # GPU训练时启用锁页内存，加速数据传输
         prefetch_factor=Config.PREFETCH_FACTOR,  # 预加载批次数，平衡内存和速度
-        persistent_workers=True                   # 保持worker进程存活，减少重启开销
+        persistent_workers=True,                 # 保持worker进程存活，减少重启开销
+        multiprocessing_context='spawn' if os.name == 'nt' else None  # Windows兼容性
     )
     
     # 创建固定随机种子的生成器，确保训练过程的可重复性
@@ -420,7 +551,7 @@ def train_model(
         project='U-Net', 
         resume='allow', 
         anonymous='must',
-        name=f'unet_training_{epochs}epochs_bs{batch_size}'
+        name=f'unet训练_{epochs}轮次_批次{batch_size}'
     )
     
     # 记录训练配置参数到WandB
@@ -502,7 +633,14 @@ def train_model(
         criterion = nn.BCEWithLogitsLoss()  # 二分类BCE损失
         logging.info('使用BCE损失函数（二分类任务）')
     
-    # 5.5 训练状态变量
+    # 5.5 早停机制初始化
+    early_stopping = EarlyStopping(
+        patience=Config.PATIENCE, 
+        min_delta=Config.MIN_DELTA, 
+        restore_best_weights=True
+    )
+    
+    # 5.6 训练状态变量
     global_step = 0  # 全局训练步数计数器，用于WandB日志记录
     
     logging.info('训练组件初始化完成')
@@ -518,7 +656,7 @@ def train_model(
         epoch_loss = 0  # 当前轮次的累积损失
         
         # 创建进度条，显示当前轮次的训练进度
-        with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
+        with tqdm(total=n_train, desc=f'轮次 {epoch}/{epochs}', unit='张') as pbar:
             # 遍历训练集中的所有批次
             for batch in train_loader:
                 # 从批次中提取图像和真实掩码
@@ -575,11 +713,9 @@ def train_model(
                         ce_loss = criterion(masks_pred, true_masks)
                         
                         # 将预测结果转换为概率分布（softmax）
-                        pred_probs = F.softmax(masks_pred, dim=1).float()
+                        pred_probs = F.softmax(masks_pred, dim=1)
                         
-                        # 将真实标签转换为one-hot编码格式
-                        # one_hot: (batch_size, height, width) -> (batch_size, height, width, n_classes)
-                        # permute: 调整维度顺序为(batch_size, n_classes, height, width)
+                        # 将真实标签转换为one-hot编码格式（优化内存使用）
                         true_one_hot = F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float()
                         
                         # 计算多分类Dice损失
@@ -623,17 +759,17 @@ def train_model(
                 global_step += 1
                 epoch_loss += loss.item()  # 累加当前轮次的损失
                 
-                # 记录训练指标到WandB
-                # 实时监控训练过程，便于调试和优化
-                experiment.log({
-                    'train loss': loss.item(),      # 当前批次的损失值
-                    'step': global_step,            # 全局训练步数
-                    'epoch': epoch,                 # 当前轮次
-                    'learning rate': optimizer.param_groups[0]['lr']  # 当前学习率
-                })
+                # 记录训练指标到WandB（每隔一定步数记录一次，减少I/O开销）
+                if global_step % max(1, len(train_loader) // 20) == 0:  # 每轮记录20次
+                    experiment.log({
+                        '训练损失': loss.item(),      # 当前批次的损失值
+                        '步数': global_step,            # 全局训练步数
+                        '轮次': epoch,                 # 当前轮次
+                        '学习率': optimizer.param_groups[0]['lr']  # 当前学习率
+                    })
                 
                 # 更新进度条后缀，显示当前批次的损失
-                pbar.set_postfix(**{'loss (batch)': loss.item()})
+                pbar.set_postfix(**{'损失 (批次)': loss.item()})
 
                 # ================================
                 # 6.4 定期验证和可视化记录
@@ -644,39 +780,12 @@ def train_model(
                 if division_step > 0:
                     if global_step % division_step == 0:
                         # 收集模型权重和梯度的分布信息
-                        # 用于监控训练过程的稳定性和梯度流动情况
-                        histograms = {}
-                        for tag, value in model.named_parameters():
-                            tag = tag.replace('/', '.')  # 将路径分隔符替换为点号，便于WandB显示
-                            
-                            # 记录权重分布直方图（排除无穷大和NaN值）
-                            try:
-                                if value.grad is not None and not (torch.isinf(value) | torch.isnan(value)).any():
-                                    # 确保张量是连续的且非稀疏的
-                                    weight_data = value.data.cpu().contiguous()
-                                    if not weight_data.is_sparse:
-                                        histograms['Weights/' + tag] = wandb.Histogram(weight_data)
-                            except Exception:
-                                # 如果记录权重失败，跳过但不影响训练
-                                pass
-                            
-                            # 记录梯度分布直方图（排除无穷大和NaN值）
-                            try:
-                                if value.grad is not None and not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                                    # 确保梯度张量是连续的且非稀疏的
-                                    grad_data = value.grad.data.cpu().contiguous()
-                                    if not grad_data.is_sparse:
-                                        histograms['Gradients/' + tag] = wandb.Histogram(grad_data)
-                            except Exception:
-                                # 如果记录梯度失败，跳过但不影响训练
-                                pass
+                        histograms = _log_histograms(model)
 
                         # 在验证集上评估模型性能
-                        # 这会切换到评估模式，计算Dice系数等指标
                         val_score = evaluate(model, val_loader, device, amp)
                         
                         # 根据验证分数更新学习率调度器
-                        # 余弦退火调度器会根据验证性能调整学习率
                         scheduler.step(val_score)
 
                         # 记录验证结果
@@ -684,37 +793,18 @@ def train_model(
                         
                         # 记录详细的验证信息到WandB
                         try:
-                            # 处理预测掩码的维度问题，确保与WandB兼容
-                            if model.n_classes == 1:
-                                # 二分类任务：使用sigmoid + 阈值处理
-                                pred_mask = (F.sigmoid(masks_pred[0, 0]) > 0.5).float().cpu()
-                            else:
-                                # 多分类任务：使用argmax处理
-                                pred_mask = masks_pred.argmax(dim=1)[0].float().cpu()
-                            
-                            # 确保掩码张量是正确的2D格式用于WandB
-                            if pred_mask.dim() > 2:
-                                pred_mask = pred_mask.squeeze()
-                            if pred_mask.dim() < 2:
-                                pred_mask = pred_mask.unsqueeze(0)
-                                
-                            # 确保真实掩码也是2D格式
-                            true_mask = true_masks[0].float().cpu()
-                            if true_mask.dim() > 2:
-                                true_mask = true_mask.squeeze()
-                            if true_mask.dim() < 2:
-                                true_mask = true_mask.unsqueeze(0)
+                            pred_mask, true_mask = _prepare_mask_for_logging(masks_pred, true_masks, model)
                             
                             experiment.log({
-                                'learning rate': optimizer.param_groups[0]['lr'],  # 当前学习率
-                                'validation Dice': val_score,                       # 验证集Dice分数
-                                'images': wandb.Image(images[0].cpu()),            # 输入图像
-                                'masks': {                                         # 掩码对比
-                                    'true': wandb.Image(true_mask),                # 真实掩码
-                                    'pred': wandb.Image(pred_mask),                # 预测掩码
+                                '学习率': optimizer.param_groups[0]['lr'],  # 当前学习率
+                                '验证Dice分数': val_score,                       # 验证集Dice分数
+                                '图像': wandb.Image(images[0].cpu()),            # 输入图像
+                                '掩码': {                                         # 掩码对比
+                                    '真实': wandb.Image(true_mask),                # 真实掩码
+                                    '预测': wandb.Image(pred_mask),                # 预测掩码
                                 },
-                                'step': global_step,                               # 全局步数
-                                'epoch': epoch,                                    # 当前轮次
+                                '步数': global_step,                               # 全局步数
+                                '轮次': epoch,                                    # 当前轮次
                                 **histograms                                       # 权重和梯度分布
                             })
                         except Exception as e:
@@ -723,34 +813,60 @@ def train_model(
                             pass
 
         # ================================
-        # 6.5 模型检查点保存
+        # 6.5 每轮结束后的验证和早停检查
+        # ================================
+        # 在每个epoch结束后进行完整验证
+        model.eval()
+        with torch.no_grad():
+            epoch_val_score = evaluate(model, val_loader, device, amp)
+            logging.info(f'Epoch {epoch} 验证集Dice分数: {epoch_val_score:.4f}')
+            
+            # 检查早停条件
+            if early_stopping(epoch_val_score, model):
+                logging.info(f'早停触发！连续{Config.PATIENCE}轮验证指标未提升')
+                logging.info(f'最佳验证分数: {early_stopping.best_score:.4f}')
+                break
+        
+        # ================================
+        # 6.6 模型检查点保存
         # ================================
         # 每轮训练结束后保存模型状态，支持断点续训和模型恢复
         if save_checkpoint:
             # 确保检查点目录存在
             Path(Config.CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
             
+            avg_train_loss = epoch_loss / len(train_loader)
+            
             # 构建检查点数据字典
-            # 包含训练恢复所需的所有状态信息
             checkpoint = {
                 'epoch': epoch,                                    # 当前训练轮次
                 'model_state_dict': model.state_dict(),           # 模型参数状态
                 'optimizer_state_dict': optimizer.state_dict(),   # 优化器状态（包括动量等）
                 'scheduler_state_dict': scheduler.state_dict(),   # 学习率调度器状态
-                'loss': epoch_loss / len(train_loader),           # 平均损失
+                'loss': avg_train_loss,                           # 平均损失
+                'val_score': epoch_val_score,                     # 验证分数
                 'mask_values': dataset.mask_values                # 数据集掩码值（用于推理时的标签映射）
             }
             
-            # 保存检查点文件
+            # 保存当前epoch检查点
             checkpoint_path = Config.CHECKPOINT_DIR / f'checkpoint_epoch{epoch}.pth'
             torch.save(checkpoint, str(checkpoint_path))
             logging.info(f'检查点 {epoch} 已保存至 {checkpoint_path}!')
             
+            # 保存最佳模型
+            best_model_path = Config.CHECKPOINT_DIR / 'best_model.pth'
+            is_best_model = (epoch_val_score >= early_stopping.best_score - Config.MIN_DELTA)
+            if is_best_model:
+                torch.save(checkpoint, str(best_model_path))
+                logging.info(f'新的最佳模型已保存！验证分数: {epoch_val_score:.4f}')
+            
             # 记录检查点信息到WandB
             experiment.log({
-                'epoch': epoch,
-                'avg_train_loss': epoch_loss / len(train_loader),
-                'checkpoint_saved': True
+                '轮次': epoch,
+                '平均训练损失': avg_train_loss,
+                '验证分数': epoch_val_score,
+                '检查点已保存': True,
+                '是否最佳模型': is_best_model
             })
 
 
