@@ -266,6 +266,7 @@ def train_model(
         weight_decay: float = 1e-8,
         momentum: float = 0.999,
         gradient_clipping: float = 1.0,
+        accumulate_grad_batches: int = 1,  # 梯度累积批次数
 ):
     """
     UNet模型训练的主函数，实现完整的训练流程
@@ -509,13 +510,14 @@ def train_model(
     # 动态配置数据加载器参数，根据设备和批次大小优化
     num_workers = min(Config.NUM_WORKERS, batch_size * 2) if batch_size > 1 else Config.NUM_WORKERS
     
+    # 根据设备类型优化数据加载器配置
     loader_args = dict(
         batch_size=batch_size,                    # 批次大小，根据显存调整
         num_workers=num_workers,                 # 动态调整数据加载线程数
-        pin_memory=Config.PIN_MEMORY,            # GPU训练时启用锁页内存，加速数据传输
-        prefetch_factor=Config.PREFETCH_FACTOR,  # 预加载批次数，平衡内存和速度
-        persistent_workers=True,                 # 保持worker进程存活，减少重启开销
-        multiprocessing_context='spawn' if os.name == 'nt' else None  # Windows兼容性
+        pin_memory=device.type == 'cuda',        # 仅在CUDA设备上启用锁页内存
+        prefetch_factor=Config.PREFETCH_FACTOR if num_workers > 0 else None,  # 预加载批次数
+        persistent_workers=num_workers > 0,      # 仅在多进程时保持worker存活
+        multiprocessing_context='spawn' if os.name == 'nt' and num_workers > 0 else None  # Windows兼容性
     )
     
     # 创建固定随机种子的生成器，确保训练过程的可重复性
@@ -616,12 +618,16 @@ def train_model(
     # 5.3 混合精度训练缩放器
     # 用于混合精度训练的梯度缩放，确保训练稳定性
     # 当使用FP16精度时，梯度可能过小，需要放大后更新参数
-    try:
-        # 使用新的API (PyTorch 2.0+)
-        grad_scaler = torch.amp.GradScaler('cuda', enabled=amp)
-    except AttributeError:
-        # 向后兼容旧版本PyTorch
-        grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    if amp and device.type == 'cuda':
+        try:
+            # 使用新的API (PyTorch 2.0+)
+            grad_scaler = torch.amp.GradScaler('cuda', enabled=True)
+        except AttributeError:
+            # 向后兼容旧版本PyTorch
+            grad_scaler = torch.cuda.amp.GradScaler(enabled=True)
+    else:
+        # CPU或MPS设备不支持混合精度，创建禁用的scaler
+        grad_scaler = torch.cuda.amp.GradScaler(enabled=False)
     
     # 5.4 损失函数配置
     # 根据任务类型选择合适的损失函数
@@ -642,6 +648,11 @@ def train_model(
     
     # 5.6 训练状态变量
     global_step = 0  # 全局训练步数计数器，用于WandB日志记录
+    accumulation_steps = 0  # 梯度累积步数计数器
+    
+    # 计算有效批次大小
+    effective_batch_size = batch_size * accumulate_grad_batches
+    logging.info(f'有效批次大小: {effective_batch_size} (批次大小: {batch_size} × 累积步数: {accumulate_grad_batches})')
     
     logging.info('训练组件初始化完成')
 
@@ -670,8 +681,10 @@ def train_model(
                 # 将数据移动到指定设备并转换为合适的类型
                 # images: 转换为float32类型，使用channels_last内存格式优化GPU性能
                 # true_masks: 转换为long类型，因为掩码标签通常是整数索引
-                images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-                true_masks = true_masks.to(device=device, dtype=torch.long)
+                images = images.to(device=device, dtype=torch.float32, 
+                                 memory_format=torch.channels_last if device.type == 'cuda' else torch.contiguous_format,
+                                 non_blocking=True)
+                true_masks = true_masks.to(device=device, dtype=torch.long, non_blocking=True)
 
                 # ================================
                 # 6.1 前向传播与损失计算
@@ -725,31 +738,38 @@ def train_model(
                         loss = ce_loss + dice_loss_value
 
                 # ================================
-                # 6.2 反向传播与参数优化
+                # 6.2 反向传播与参数优化（支持梯度累积）
                 # ================================
-                # 清空梯度缓存，set_to_none=True可以节省内存
-                optimizer.zero_grad(set_to_none=True)
+                # 将损失除以累积步数，实现梯度累积
+                loss = loss / accumulate_grad_batches
                 
                 # 梯度缩放反向传播
                 # 在混合精度训练中，损失需要先放大再反向传播
                 # 这样可以避免梯度下溢问题，保持训练稳定性
                 grad_scaler.scale(loss).backward()
                 
-                # 取消梯度缩放，准备进行梯度裁剪和参数更新
-                grad_scaler.unscale_(optimizer)
+                accumulation_steps += 1
                 
-                # 梯度裁剪：防止梯度爆炸
-                # 当梯度的L2范数超过阈值时，按比例缩放所有梯度
-                # 这是RNN和深度网络训练中的重要技术
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
-                
-                # 执行优化器步骤，更新模型参数
-                # 在混合精度训练中，需要先缩放梯度再更新
-                grad_scaler.step(optimizer)
-                
-                # 更新梯度缩放器的内部状态
-                # 根据是否发生梯度溢出，动态调整缩放因子
-                grad_scaler.update()
+                # 当达到累积步数时，执行参数更新
+                if accumulation_steps % accumulate_grad_batches == 0:
+                    # 取消梯度缩放，准备进行梯度裁剪和参数更新
+                    grad_scaler.unscale_(optimizer)
+                    
+                    # 梯度裁剪：防止梯度爆炸
+                    # 当梯度的L2范数超过阈值时，按比例缩放所有梯度
+                    # 这是RNN和深度网络训练中的重要技术
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
+                    
+                    # 执行优化器步骤，更新模型参数
+                    # 在混合精度训练中，需要先缩放梯度再更新
+                    grad_scaler.step(optimizer)
+                    
+                    # 更新梯度缩放器的内部状态
+                    # 根据是否发生梯度溢出，动态调整缩放因子
+                    grad_scaler.update()
+                    
+                    # 清空梯度缓存，set_to_none=True可以节省内存
+                    optimizer.zero_grad(set_to_none=True)
 
                 # ================================
                 # 6.3 训练状态更新和日志记录
@@ -762,10 +782,11 @@ def train_model(
                 # 记录训练指标到WandB（每隔一定步数记录一次，减少I/O开销）
                 if global_step % max(1, len(train_loader) // 20) == 0:  # 每轮记录20次
                     experiment.log({
-                        '训练损失': loss.item(),      # 当前批次的损失值
+                        '训练损失': loss.item() * accumulate_grad_batches,  # 恢复原始损失值
                         '步数': global_step,            # 全局训练步数
                         '轮次': epoch,                 # 当前轮次
-                        '学习率': optimizer.param_groups[0]['lr']  # 当前学习率
+                        '学习率': optimizer.param_groups[0]['lr'],  # 当前学习率
+                        '有效批次大小': effective_batch_size  # 有效批次大小
                     })
                 
                 # 更新进度条后缀，显示当前批次的损失
@@ -995,6 +1016,8 @@ def get_args():
     parser.add_argument('--amp', action='store_true', default=False, help='使用混合精度训练')
     parser.add_argument('--bilinear', action='store_true', default=False, help='使用双线性上采样')
     parser.add_argument('--classes', '-c', type=int, default=2, help='类别数')
+    parser.add_argument('--accumulate-grad-batches', type=int, default=1, 
+                        help='梯度累积批次数，用于模拟更大的批次大小')
 
     return parser.parse_args()
 
@@ -1136,7 +1159,8 @@ if __name__ == '__main__':
             device=device,
             img_scale=args.scale,
             val_percent=args.val / 100,
-            amp=args.amp
+            amp=args.amp,
+            accumulate_grad_batches=args.accumulate_grad_batches
         )
         
         logging.info('🎉 训练成功完成！')
@@ -1190,7 +1214,8 @@ if __name__ == '__main__':
             device=device,
             img_scale=min(0.25, args.scale),  # 减小图像尺寸
             val_percent=args.val / 100,
-            amp=True  # 强制启用混合精度
+            amp=True,  # 强制启用混合精度
+            accumulate_grad_batches=max(2, args.accumulate_grad_batches)  # 增加梯度累积
         )
         
     except KeyboardInterrupt:
