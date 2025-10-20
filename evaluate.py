@@ -124,9 +124,15 @@ def evaluate(net, dataloader, device, amp):
                 assert mask_true.min() >= 0 and mask_true.max() < net.n_classes, '真实掩码的索引应该在[0, n_classes]范围内'
                 
                 # 将真实标签转换为one-hot编码格式
+                # 确保mask_true是正确的维度：(batch_size, height, width)
+                if mask_true.dim() == 4:  # 如果是4维，去掉通道维度
+                    mask_true_for_onehot = mask_true.squeeze(1)
+                else:
+                    mask_true_for_onehot = mask_true
+                
                 # one_hot: (batch_size, height, width) -> (batch_size, height, width, n_classes)
                 # permute(0, 3, 1, 2): 调整维度顺序为(batch_size, n_classes, height, width)
-                mask_true = F.one_hot(mask_true, net.n_classes).permute(0, 3, 1, 2).float()
+                mask_true = F.one_hot(mask_true_for_onehot, net.n_classes).permute(0, 3, 1, 2).float()
                 
                 # 将预测结果转换为one-hot编码格式
                 # argmax(dim=1): 在类别维度上取最大值的索引，得到预测类别

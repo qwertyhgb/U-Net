@@ -184,28 +184,50 @@ def _prepare_mask_for_logging(masks_pred: torch.Tensor, true_masks: torch.Tensor
     Returns:
         tuple: (处理后的预测掩码, 处理后的真实掩码)
     """
-    # 处理预测掩码的维度问题，确保与WandB兼容
-    if model.n_classes == 1:
-        # 二分类任务：使用sigmoid + 阈值处理
-        pred_mask = (F.sigmoid(masks_pred[0, 0]) > 0.5).float().cpu()
-    else:
-        # 多分类任务：使用argmax处理
-        pred_mask = masks_pred.argmax(dim=1)[0].float().cpu()
-    
-    # 确保掩码张量是正确的2D格式用于WandB
-    if pred_mask.dim() > 2:
-        pred_mask = pred_mask.squeeze()
-    if pred_mask.dim() < 2:
-        pred_mask = pred_mask.unsqueeze(0)
+    try:
+        # 处理预测掩码的维度问题，确保与WandB兼容
+        if model.n_classes == 1:
+            # 二分类任务：使用sigmoid + 阈值处理
+            pred_mask = (F.sigmoid(masks_pred[0, 0]) > 0.5).float().cpu()
+        else:
+            # 多分类任务：使用argmax处理
+            pred_mask = masks_pred.argmax(dim=1)[0].float().cpu()
         
-    # 确保真实掩码也是2D格式
-    true_mask = true_masks[0].float().cpu()
-    if true_mask.dim() > 2:
-        true_mask = true_mask.squeeze()
-    if true_mask.dim() < 2:
-        true_mask = true_mask.unsqueeze(0)
-    
-    return pred_mask, true_mask
+        # 确保掩码张量是正确的2D格式用于WandB
+        while pred_mask.dim() > 2:
+            pred_mask = pred_mask.squeeze()
+        while pred_mask.dim() < 2:
+            pred_mask = pred_mask.unsqueeze(0)
+            
+        # 确保真实掩码也是2D格式
+        true_mask = true_masks[0].float().cpu()
+        
+        # 处理真实掩码的维度
+        while true_mask.dim() > 2:
+            true_mask = true_mask.squeeze()
+        while true_mask.dim() < 2:
+            true_mask = true_mask.unsqueeze(0)
+        
+        # 确保掩码尺寸匹配
+        if pred_mask.shape != true_mask.shape:
+            # 如果尺寸不匹配，调整真实掩码尺寸
+            if true_mask.numel() == pred_mask.numel():
+                true_mask = true_mask.view(pred_mask.shape)
+            else:
+                # 如果元素数量也不匹配，使用插值调整
+                true_mask = F.interpolate(
+                    true_mask.unsqueeze(0).unsqueeze(0), 
+                    size=pred_mask.shape, 
+                    mode='nearest'
+                ).squeeze()
+        
+        return pred_mask, true_mask
+        
+    except Exception as e:
+        logging.warning(f'掩码预处理失败: {e}')
+        # 返回简单的占位符掩码
+        dummy_mask = torch.zeros(64, 64)
+        return dummy_mask, dummy_mask
 
 
 # ================================
@@ -729,7 +751,15 @@ def train_model(
                         pred_probs = F.softmax(masks_pred, dim=1)
                         
                         # 将真实标签转换为one-hot编码格式（优化内存使用）
-                        true_one_hot = F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float()
+                        # 确保true_masks是正确的维度：(batch_size, height, width)
+                        if true_masks.dim() == 4:  # 如果是4维，去掉通道维度
+                            true_masks_for_onehot = true_masks.squeeze(1)
+                        else:
+                            true_masks_for_onehot = true_masks
+                        
+                        # 转换为one-hot编码：(batch_size, height, width) -> (batch_size, height, width, n_classes)
+                        # 然后调整维度顺序为：(batch_size, n_classes, height, width)
+                        true_one_hot = F.one_hot(true_masks_for_onehot, model.n_classes).permute(0, 3, 1, 2).float()
                         
                         # 计算多分类Dice损失
                         dice_loss_value = dice_loss(pred_probs, true_one_hot, multiclass=True)
@@ -816,22 +846,48 @@ def train_model(
                         try:
                             pred_mask, true_mask = _prepare_mask_for_logging(masks_pred, true_masks, model)
                             
-                            experiment.log({
+                            # 基础日志记录（总是尝试记录）
+                            basic_log = {
                                 '学习率': optimizer.param_groups[0]['lr'],  # 当前学习率
                                 '验证Dice分数': val_score,                       # 验证集Dice分数
-                                '图像': wandb.Image(images[0].cpu()),            # 输入图像
-                                '掩码': {                                         # 掩码对比
-                                    '真实': wandb.Image(true_mask),                # 真实掩码
-                                    '预测': wandb.Image(pred_mask),                # 预测掩码
-                                },
                                 '步数': global_step,                               # 全局步数
                                 '轮次': epoch,                                    # 当前轮次
-                                **histograms                                       # 权重和梯度分布
-                            })
+                            }
+                            
+                            # 尝试添加图像和掩码（可能失败）
+                            try:
+                                basic_log.update({
+                                    '图像': wandb.Image(images[0].cpu()),            # 输入图像
+                                    '掩码': {                                         # 掩码对比
+                                        '真实': wandb.Image(true_mask),                # 真实掩码
+                                        '预测': wandb.Image(pred_mask),                # 预测掩码
+                                    },
+                                })
+                            except Exception as img_e:
+                                logging.warning(f'图像记录失败: {img_e}')
+                            
+                            # 尝试添加直方图（可能失败）
+                            try:
+                                basic_log.update(histograms)
+                            except Exception as hist_e:
+                                logging.warning(f'直方图记录失败: {hist_e}')
+                            
+                            # 记录到WandB
+                            experiment.log(basic_log)
+                            
                         except Exception as e:
                             # 如果记录失败，继续训练而不中断
                             logging.warning(f'WandB记录失败: {e}')
-                            pass
+                            # 至少记录基本指标
+                            try:
+                                experiment.log({
+                                    '学习率': optimizer.param_groups[0]['lr'],
+                                    '验证Dice分数': val_score,
+                                    '步数': global_step,
+                                    '轮次': epoch,
+                                })
+                            except:
+                                pass
 
         # ================================
         # 6.5 每轮结束后的验证和早停检查
