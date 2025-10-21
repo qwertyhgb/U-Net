@@ -50,35 +50,31 @@ UNet是一种编码器-解码器架构的卷积神经网络，在图像分割领
 # 标准库导入
 # ================================
 import argparse  # 用于解析命令行参数，支持复杂的参数配置
-import logging   # 用于记录训练日志，支持不同级别的日志输出
-import os        # 处理操作系统相关操作，如文件路径、环境变量等
-import random    # 随机数生成，用于数据增强和初始化
-import sys       # 系统相关功能，如程序退出、异常处理等
-
-# ================================
-# 深度学习相关库导入
-# ================================
-import torch            # PyTorch深度学习框架核心库
-import torch.nn as nn   # 神经网络模块，包含各种层和激活函数
-import torch.nn.functional as F  # 神经网络函数库，提供无状态的函数式接口
-import torchvision.transforms as transforms        # 图像变换工具，用于数据预处理
-import torchvision.transforms.functional as TF     # 图像变换函数，提供底层变换操作
-from torch import optim   # 优化器模块，包含各种梯度下降算法
-from torch.utils.data import DataLoader, random_split  # 数据加载和划分工具
-
+import logging  # 用于记录训练日志，支持不同级别的日志输出
+import os  # 处理操作系统相关操作，如文件路径、环境变量等
+import sys  # 系统相关功能，如程序退出、异常处理等
 # ================================
 # 工具库导入
 # ================================
 from pathlib import Path  # 路径处理工具，提供跨平台路径操作
-from tqdm import tqdm     # 进度条显示库，提供美观的训练进度可视化
 from typing import Tuple, Dict, Any
+
+# ================================
+# 深度学习相关库导入
+# ================================
+import torch  # PyTorch深度学习框架核心库
+import torch.nn as nn  # 神经网络模块，包含各种层和激活函数
+import torch.nn.functional as F  # 神经网络函数库，提供无状态的函数式接口
+from torch import optim  # 优化器模块，包含各种梯度下降算法
+from torch.utils.data import DataLoader, random_split  # 数据加载和划分工具
+from tqdm import tqdm  # 进度条显示库，提供美观的训练进度可视化
 
 # ================================
 # 项目相关导入
 # ================================
 import wandb  # Weights & Biases实验管理平台，用于训练过程可视化和超参数调优
 from evaluate import evaluate  # 模型验证评估函数，计算Dice系数等指标
-from unet import UNet         # UNet模型架构定义，编码器-解码器分割网络
+from unet import UNet  # UNet模型架构定义，编码器-解码器分割网络
 from utils.data_loading import BasicDataset, CarvanaDataset  # 数据集加载类，支持多种数据格式
 from utils.dice_score import dice_loss  # Dice损失函数，专门用于分割任务的损失计算
 

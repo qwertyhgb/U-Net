@@ -1,6 +1,18 @@
-matplotlib==3.7.5
-numpy==1.24.3
-Pillow==10.3.0
-torch==2.0.0
-torchvision==0.15.0
-tqdm==4.66.4
+# 核心深度学习框架
+torch>=2.0.0
+torchvision>=0.15.0
+
+# 图像处理
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# 可视化和进度条
+matplotlib>=3.7.0
+tqdm>=4.66.0
+
+# 可选依赖（如果需要OpenCV功能）
+# opencv-python>=4.8.0
+
+# 开发和调试
+# tensorboard>=2.13.0
+# wandb>=0.15.0
