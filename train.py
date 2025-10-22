@@ -89,16 +89,26 @@ def _log_histograms(model: torch.nn.Module) -> Dict[str, Any]:
         tag = tag.replace('/', '.')
         
         try:
+            # 检查权重数据
             if not (torch.isinf(value) | torch.isnan(value)).any():
-                weight_data = value.data.cpu().contiguous()
+                weight_data = value.data.cpu()
+                # 确保数据是连续的且不是稀疏张量
                 if not weight_data.is_sparse:
-                    histograms['权重/' + tag] = wandb.Histogram(weight_data)
+                    weight_data = weight_data.contiguous()
+                    # 转换为numpy数组，避免wandb处理张量时的问题
+                    histograms['权重/' + tag] = wandb.Histogram(weight_data.numpy())
             
+            # 检查梯度数据
             if value.grad is not None and not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                grad_data = value.grad.data.cpu().contiguous()
+                grad_data = value.grad.data.cpu()
+                # 确保数据是连续的且不是稀疏张量
                 if not grad_data.is_sparse:
-                    histograms['梯度/' + tag] = wandb.Histogram(grad_data)
-        except Exception:
+                    grad_data = grad_data.contiguous()
+                    # 转换为numpy数组，避免wandb处理张量时的问题
+                    histograms['梯度/' + tag] = wandb.Histogram(grad_data.numpy())
+        except Exception as e:
+            # 静默处理异常，避免中断训练
+            logging.debug(f'记录参数 {tag} 的直方图时出错: {e}')
             pass
     
     return histograms
@@ -149,11 +159,14 @@ def _prepare_mask_for_logging(masks_pred: torch.Tensor, true_masks: torch.Tensor
     try:
         # 处理预测掩码
         if model.n_classes == 1:
+            # 二分类：取第一个样本的第一个通道
             pred_mask = (F.sigmoid(masks_pred[0, 0]) > 0.5).float().cpu()
         else:
+            # 多分类：取argmax后的第一个样本
             pred_mask = masks_pred.argmax(dim=1)[0].float().cpu()
         
-        # 确保是2D张量
+        # 确保pred_mask是连续的2D张量
+        pred_mask = pred_mask.contiguous()
         while pred_mask.dim() > 2:
             pred_mask = pred_mask.squeeze(0)
         if pred_mask.dim() < 2:
@@ -161,6 +174,7 @@ def _prepare_mask_for_logging(masks_pred: torch.Tensor, true_masks: torch.Tensor
             
         # 处理真实掩码
         true_mask = true_masks[0].float().cpu()
+        true_mask = true_mask.contiguous()
         while true_mask.dim() > 2:
             true_mask = true_mask.squeeze(0)
         if true_mask.dim() < 2:
@@ -172,16 +186,24 @@ def _prepare_mask_for_logging(masks_pred: torch.Tensor, true_masks: torch.Tensor
                 true_mask = true_mask.reshape(pred_mask.shape)
             else:
                 # 使用插值调整尺寸
-                true_mask = F.interpolate(
-                    true_mask.unsqueeze(0).unsqueeze(0), 
+                # 确保输入是4D张量 (N, C, H, W)
+                true_mask_4d = true_mask.unsqueeze(0).unsqueeze(0)
+                true_mask_resized = F.interpolate(
+                    true_mask_4d, 
                     size=pred_mask.shape, 
                     mode='nearest'
-                ).squeeze(0).squeeze(0)
+                )
+                true_mask = true_mask_resized.squeeze(0).squeeze(0).contiguous()
+        
+        # 最终验证：确保返回的是2D张量
+        assert pred_mask.dim() == 2, f"pred_mask应该是2D张量，但得到{pred_mask.dim()}维"
+        assert true_mask.dim() == 2, f"true_mask应该是2D张量，但得到{true_mask.dim()}维"
         
         return pred_mask, true_mask
         
     except Exception as e:
         logging.warning(f'掩码预处理失败: {e}')
+        # 返回安全的默认值
         return torch.zeros(64, 64), torch.zeros(64, 64)
 
 
