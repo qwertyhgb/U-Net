@@ -147,28 +147,36 @@ def _prepare_mask_for_logging(masks_pred: torch.Tensor, true_masks: torch.Tensor
                             model: torch.nn.Module) -> Tuple[torch.Tensor, torch.Tensor]:
     """准备用于WandB日志记录的掩码张量"""
     try:
+        # 处理预测掩码
         if model.n_classes == 1:
             pred_mask = (F.sigmoid(masks_pred[0, 0]) > 0.5).float().cpu()
         else:
             pred_mask = masks_pred.argmax(dim=1)[0].float().cpu()
         
-        pred_mask = pred_mask.squeeze()
+        # 确保是2D张量
+        while pred_mask.dim() > 2:
+            pred_mask = pred_mask.squeeze(0)
         if pred_mask.dim() < 2:
             pred_mask = pred_mask.unsqueeze(0)
             
-        true_mask = true_masks[0].float().cpu().squeeze()
+        # 处理真实掩码
+        true_mask = true_masks[0].float().cpu()
+        while true_mask.dim() > 2:
+            true_mask = true_mask.squeeze(0)
         if true_mask.dim() < 2:
             true_mask = true_mask.unsqueeze(0)
         
+        # 确保尺寸匹配
         if pred_mask.shape != true_mask.shape:
             if true_mask.numel() == pred_mask.numel():
-                true_mask = true_mask.view(pred_mask.shape)
+                true_mask = true_mask.reshape(pred_mask.shape)
             else:
+                # 使用插值调整尺寸
                 true_mask = F.interpolate(
                     true_mask.unsqueeze(0).unsqueeze(0), 
                     size=pred_mask.shape, 
                     mode='nearest'
-                ).squeeze()
+                ).squeeze(0).squeeze(0)
         
         return pred_mask, true_mask
         
@@ -359,37 +367,6 @@ def train_model(
        - 权重和梯度分布可视化
        - 训练过程图像和预测结果展示
     
-    ================================
-    使用示例：
-    ================================
-    
-    ```python
-    # 基础训练示例
-    model = UNet(n_channels=3, n_classes=2)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    train_model(
-        model=model,
-        device=device,
-        epochs=50,
-        batch_size=8,
-        learning_rate=1e-4,
-        val_percent=0.2,
-        amp=True
-    )
-    
-    # 高性能训练示例
-    train_model(
-        model=model,
-        device=device,
-        epochs=100,
-        batch_size=16,
-        learning_rate=1e-4,
-        img_scale=0.75,
-        amp=True,
-        weight_decay=1e-5
-    )
-    ```
     
     ================================
     注意事项和最佳实践：
